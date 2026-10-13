@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import threading
 import time
+import zlib
 from dataclasses import replace
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
@@ -266,8 +268,15 @@ class UnifiedRadixCache(BasePrefixCache):
             "declined_rate_limited": 0,
             "declined_anchor_lost": 0,
             "declined_device_covered": 0,
+            "declined_aux_alloc_failed": 0,
+            "declined_already_inflight": 0,
             "revoked_insufficient": 0,
             "revoked_full_miss": 0,
+            "resolved_full_hit": 0,
+            "resolved_partial_hit": 0,
+            "resolved_full_miss": 0,
+            "terminated_best_effort": 0,
+            "terminated_timeout": 0,
             "l3_demand_requests": 0,
             "l3_miss_tokens": 0,
             "l1l2_miss_tokens": 0,
@@ -1717,12 +1726,22 @@ class UnifiedRadixCache(BasePrefixCache):
         if prefetch_length < self.prefetch_threshold:
             if prefetch_length > 0:
                 stats["declined_too_short"] += 1
+                self._emit_hicache_decision_trace(
+                    req_id,
+                    outcome="declined_too_short",
+                    requested_tokens=prefetch_length,
+                )
             # A too-short/fully-matched suffix can become a full recompute if
             # the device match evicts while queued; arm the paced retry.
             self._storage_prefetch_missed_rids.add(req_id)
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
+            self._emit_hicache_decision_trace(
+                req_id,
+                outcome="declined_rate_limited",
+                requested_tokens=prefetch_length,
+            )
             self._storage_prefetch_missed_rids.add(req_id)
             return
         if req_id in self.ongoing_prefetch or (
@@ -1730,6 +1749,12 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             # A fetch (or an unconsumed hold) already exists for this rid;
             # overwriting would leak its staging slots.
+            stats["declined_already_inflight"] += 1
+            self._emit_hicache_decision_trace(
+                req_id,
+                outcome="declined_already_inflight",
+                requested_tokens=prefetch_length,
+            )
             return
 
         # Buffer mode holds no tree state during the fetch: buffers are
@@ -1779,6 +1804,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.storage_metrics_collector.log_prefetch_aux_alloc_failed_tokens(
                     len(prefetch_key)
                 )
+            stats["declined_aux_alloc_failed"] += 1
+            self._emit_hicache_decision_trace(
+                req_id,
+                outcome="declined_aux_alloc_failed",
+                requested_tokens=prefetch_length,
+            )
             self.cache_controller.append_host_mem_release(
                 extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
             )
@@ -1867,12 +1898,25 @@ class UnifiedRadixCache(BasePrefixCache):
         _, _, _, operation, _, _ = self.ongoing_prefetch[req_id]
 
         # Determine whether or not we should terminate this prefetch request.
-        should_terminate = operation.is_terminated() or self._can_terminate_prefetch(
-            operation
-        )
+        was_terminated = operation.is_terminated()
+        should_terminate = was_terminated or self._can_terminate_prefetch(operation)
 
         if not should_terminate:
             return False
+
+        if not was_terminated and self.prefetch_stop_policy in (
+            "best_effort",
+            "timeout",
+        ):
+            outcome = f"terminated_{self.prefetch_stop_policy}"
+            self._prefetch_outcome_stats[outcome] += 1
+            self._emit_hicache_trace(
+                operation,
+                event="termination",
+                outcome=outcome,
+                force=self.prefetch_stop_policy == "timeout",
+                before_host_alloc=operation.host_indices is None,
+            )
 
         self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
@@ -1921,9 +1965,17 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.buffer_pipeline is not None:
             # No graft: release the rank-local tail beyond the synced usable
             # length, then park the bounce for admission-time consumption.
-            return self.buffer_pipeline.stage_completed_prefetch(
+            result = self.buffer_pipeline.stage_completed_prefetch(
                 req_id, completed_tokens, hash_value
             )
+            self._observe_l3_fetch(operation)
+            self._emit_hicache_trace(
+                operation,
+                event="prefetch",
+                outcome="staged",
+                loaded_tokens=completed_tokens,
+            )
+            return result
 
         fetched_key = prefetch_key[:completed_tokens]
         insert_result = self.tree_core.insert_host(
@@ -1977,6 +2029,16 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+        self._observe_l3_fetch(operation)
+        self._emit_hicache_trace(
+            operation,
+            event="prefetch",
+            outcome=(
+                "host_insert_dropped" if insert_result.host_insert_dropped else "loaded"
+            ),
+            loaded_tokens=loaded_from_storage,
+            already_host_tokens=insert_result.prefix_len,
+        )
         return
 
     def _check_hybrid_prefetch_result(
@@ -2067,6 +2129,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 completed_tokens,
                 expected_tokens,
                 keep_pages,
+            )
+            self._observe_l3_fetch(operation)
+            self._emit_hicache_trace(
+                operation,
+                event="prefetch",
+                outcome="hybrid_discarded",
+                force=True,
+                expected_tokens=expected_tokens,
+                kept_pages=keep_pages,
             )
             return False
         return True
@@ -2166,6 +2237,15 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         stats = self._prefetch_outcome_stats
         hit = max(0, min(operation.storage_hit_count, requested))
+        if hit == 0:
+            query_outcome = "full_miss"
+            stats["resolved_full_miss"] += 1
+        elif hit < requested:
+            query_outcome = "partial_hit"
+            stats["resolved_partial_hit"] += 1
+        else:
+            query_outcome = "full_hit"
+            stats["resolved_full_hit"] += 1
         if revoked:
             if hit > 0:
                 stats["revoked_insufficient"] += 1
@@ -2179,6 +2259,101 @@ class UnifiedRadixCache(BasePrefixCache):
         stats["l3_demand_total_tokens"] += total
         stats["l3_sum_rate_all"] += miss / total
         stats["l3_sum_rate_main_weighted"] += (miss / requested) * total
+        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.observe_l3_query(
+                hit_tokens=hit,
+                duration_seconds=operation.query_duration_seconds,
+            )
+        self._emit_hicache_trace(
+            operation,
+            event="query",
+            outcome=query_outcome,
+            revoked=revoked,
+        )
+
+    @staticmethod
+    def _is_hicache_trace_sampled(req_id: str) -> bool:
+        rate = min(max(envs.SGLANG_HICACHE_TRACE_SAMPLE_RATE.get(), 0.0), 1.0)
+        if rate <= 0:
+            return False
+        sample = (zlib.crc32(req_id.encode("utf-8")) & 0xFFFFFFFF) / 2**32
+        return sample < rate
+
+    def _emit_hicache_decision_trace(
+        self, req_id: str, *, outcome: str, requested_tokens: int
+    ) -> None:
+        if not self._is_hicache_trace_sampled(req_id):
+            return
+        logger.info(
+            "hicache_l3_trace=%s",
+            json.dumps(
+                {
+                    "event": "decision",
+                    "rid": req_id,
+                    "outcome": outcome,
+                    "requested_tokens": requested_tokens,
+                    "prefetch_threshold": self.prefetch_threshold,
+                    "prefetch_policy": self.prefetch_stop_policy,
+                    "host_memory_mode": self.host_memory_mode,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
+
+    def _emit_hicache_trace(
+        self,
+        operation,
+        *,
+        event: str,
+        outcome: str,
+        force: bool = False,
+        **extra,
+    ) -> None:
+        """Emit a bounded structured trace without prompt, token, or cache-key data."""
+        req_id = operation.request_id
+        if not force and not self._is_hicache_trace_sampled(req_id):
+            return
+
+        requested = int(getattr(operation, "stats_requested_tokens", 0))
+        hit_tokens = max(
+            0, min(int(getattr(operation, "storage_hit_count", 0)), requested)
+        )
+        query_pages = int(getattr(operation, "query_pages", 0))
+        hit_pages = hit_tokens // self.page_size
+        payload = {
+            "event": event,
+            "rid": req_id,
+            "outcome": outcome,
+            "requested_tokens": requested,
+            "l3_hit_tokens": hit_tokens,
+            "l3_miss_tokens": max(0, requested - hit_tokens),
+            "query_pages": query_pages,
+            "first_miss_page": hit_pages if hit_pages < query_pages else -1,
+            "completed_tokens": int(getattr(operation, "completed_tokens", 0)),
+            "query_ms": round(
+                float(getattr(operation, "query_duration_seconds", 0.0)) * 1000,
+                3,
+            ),
+            "fetch_ms": round(
+                float(getattr(operation, "fetch_duration_seconds", 0.0)) * 1000,
+                3,
+            ),
+            "elapsed_ms": round((time.monotonic() - operation.start_time) * 1000, 3),
+            "prefetch_policy": self.prefetch_stop_policy,
+            "host_memory_mode": self.host_memory_mode,
+        }
+        payload.update(extra)
+        logger.info(
+            "hicache_l3_trace=%s",
+            json.dumps(payload, separators=(",", ":"), sort_keys=True),
+        )
+
+    def _observe_l3_fetch(self, operation) -> None:
+        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.observe_l3_fetch(
+                duration_seconds=operation.fetch_duration_seconds
+            )
 
     def prefetch_outcome_stats_snapshot(self) -> dict:
         """Cumulative counters + instantaneous occupancy, in the schema

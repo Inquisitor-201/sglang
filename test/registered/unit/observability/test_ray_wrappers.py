@@ -232,11 +232,11 @@ class TestCollectorSubclassWiring(TestRayWrapperBase):
         self.assertIs(cls._histogram_cls, self.rw.RayHistogramWrapper)
         self.assertIsNone(cls._summary_cls)
 
-    def test_storage_overrides_counter_histogram_only(self):
+    def test_storage_overrides_counter_gauge_histogram(self):
         cls = self.rw.RayStorageMetricsCollector
         self.assertIs(cls._counter_cls, self.rw.RayCounterWrapper)
+        self.assertIs(cls._gauge_cls, self.rw.RayGaugeWrapper)
         self.assertIs(cls._histogram_cls, self.rw.RayHistogramWrapper)
-        self.assertIsNone(cls._gauge_cls)
         self.assertIsNone(cls._summary_cls)
 
     def test_radix_overrides_counter_histogram_only(self):

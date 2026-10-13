@@ -270,6 +270,12 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
+        # Populated by the storage-query and transfer workers. Carrying these
+        # on the operation lets the scheduler emit one correlated trace
+        # without logging cache keys or prompt contents.
+        self.query_pages = 0
+        self.query_duration_seconds = 0.0
+        self.fetch_duration_seconds = 0.0
 
         super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
@@ -1135,7 +1141,11 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_transfer(operation)
+                fetch_start = time.perf_counter()
+                try:
+                    self._page_transfer(operation)
+                finally:
+                    operation.fetch_duration_seconds = time.perf_counter() - fetch_start
 
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
@@ -1168,6 +1178,7 @@ class HiCacheController:
         return False
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        query_start = time.perf_counter()
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
@@ -1190,6 +1201,8 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
+        operation.query_pages = len(page_hashes)
+        operation.query_duration_seconds = time.perf_counter() - query_start
         return hash_value, storage_query_count
 
     def prefetch_thread_func(self):

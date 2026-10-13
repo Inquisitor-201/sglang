@@ -727,6 +727,9 @@ class Envs:
     # consumption so eviction cannot waste the fetch; cap = fraction of pool.
     SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK = EnvBool(False)
     SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
+    # Deterministic per-request sampling for structured HiCache L3 trace logs.
+    # 0 disables normal traces; timeout/error traces are always emitted.
+    SGLANG_HICACHE_TRACE_SAMPLE_RATE = EnvFloat(0.0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

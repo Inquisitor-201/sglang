@@ -1851,6 +1851,9 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
+    # Cumulative scheduler-side counters. Storage backends return the I/O
+    # samples above; UnifiedRadixCache attaches this snapshot before export.
+    prefetch_stats: Optional[Dict[str, float]] = None
 
 
 class StorageMetricsCollector(_StatLoggerDIMixin):
@@ -1867,6 +1870,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
+        self._last_prefetch_stats: Dict[str, float] = {}
 
         self.prefetched_tokens_total = Counter(
             name="sglang:prefetched_tokens_total",
@@ -1895,6 +1899,27 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.hicache_prefetch_requests_total = Counter(
+            name="sglang:hicache_prefetch_requests_total",
+            documentation=(
+                "HiCache L3 prefetch decisions and terminal outcomes. The "
+                "outcome label is a bounded internal state, never a request id."
+            ),
+            labelnames=[*labels.keys(), "outcome"],
+        )
+
+        self.hicache_l3_query_tokens_total = Counter(
+            name="sglang:hicache_l3_query_tokens_total",
+            documentation="L1/L2-missed tokens queried in L3, split by hit or miss.",
+            labelnames=[*labels.keys(), "result"],
+        )
+
+        self.hicache_prefetch_occupancy_ratio = Gauge(
+            name="sglang:hicache_prefetch_occupancy_ratio",
+            documentation="Current HiCache prefetch staging occupancy ratio.",
+            labelnames=labels.keys(),
+        )
+
         bucket_io = [
             1,
             5,
@@ -1911,6 +1936,36 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             10,
             50,
             100,
+        ]
+
+        bucket_latency = [
+            0.001,
+            0.002,
+            0.005,
+            0.01,
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1,
+            2,
+            5,
+        ]
+
+        bucket_tokens = [
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+            8192,
+            16384,
+            32768,
+            65536,
+            131072,
+            262144,
+            524288,
         ]
 
         self.histogram_prefetch_pgs = Histogram(
@@ -1941,6 +1996,30 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_bandwidth,
         )
 
+        self.histogram_l3_query_duration = Histogram(
+            name="sglang:hicache_l3_query_duration_seconds",
+            documentation="Latency of the L3 prefix existence query.",
+            labelnames=labels.keys(),
+            buckets=bucket_latency,
+        )
+
+        self.histogram_l3_fetch_duration = Histogram(
+            name="sglang:hicache_l3_fetch_duration_seconds",
+            documentation="Latency of the L3-to-host data transfer.",
+            labelnames=labels.keys(),
+            buckets=bucket_latency,
+        )
+
+        self.histogram_l3_first_miss_tokens = Histogram(
+            name="sglang:hicache_l3_first_miss_tokens",
+            documentation=(
+                "Number of consecutive L3-hit tokens before the first missing page. "
+                "A full hit records the entire queried span."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_tokens,
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -1959,6 +2038,73 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
                 num_tokens
             )
 
+    def observe_l3_query(self, *, hit_tokens: int, duration_seconds: float) -> None:
+        self.histogram_l3_query_duration.labels(**self.labels).observe(duration_seconds)
+        self.histogram_l3_first_miss_tokens.labels(**self.labels).observe(hit_tokens)
+
+    def observe_l3_fetch(self, *, duration_seconds: float) -> None:
+        self.histogram_l3_fetch_duration.labels(**self.labels).observe(duration_seconds)
+
+    def _log_prefetch_stats(self, stats: Optional[Dict[str, float]]) -> None:
+        if not stats:
+            return
+
+        occupancy_ratio = stats.get("occupancy_ratio")
+        if occupancy_ratio is not None:
+            self.hicache_prefetch_occupancy_ratio.labels(**self.labels).set(
+                occupancy_ratio
+            )
+
+        request_outcomes = (
+            "attempts",
+            "issued",
+            "declined_too_short",
+            "declined_rate_limited",
+            "declined_anchor_lost",
+            "declined_device_covered",
+            "declined_aux_alloc_failed",
+            "declined_already_inflight",
+            "revoked_insufficient",
+            "revoked_full_miss",
+            "resolved_full_hit",
+            "resolved_partial_hit",
+            "resolved_full_miss",
+            "terminated_best_effort",
+            "terminated_timeout",
+        )
+        for outcome in request_outcomes:
+            current = float(stats.get(outcome, 0.0))
+            previous = self._last_prefetch_stats.get(outcome, 0.0)
+            delta = current - previous if current >= previous else current
+            if delta > 0:
+                self.hicache_prefetch_requests_total.labels(
+                    **self.labels, outcome=outcome
+                ).inc(delta)
+
+        l1l2_miss = float(stats.get("l1l2_miss_tokens", 0.0))
+        l3_miss = float(stats.get("l3_miss_tokens", 0.0))
+        previous_l1l2_miss = self._last_prefetch_stats.get("l1l2_miss_tokens", 0.0)
+        previous_l3_miss = self._last_prefetch_stats.get("l3_miss_tokens", 0.0)
+        l1l2_delta = (
+            l1l2_miss - previous_l1l2_miss
+            if l1l2_miss >= previous_l1l2_miss
+            else l1l2_miss
+        )
+        l3_miss_delta = (
+            l3_miss - previous_l3_miss if l3_miss >= previous_l3_miss else l3_miss
+        )
+        l3_hit_delta = max(0.0, l1l2_delta - l3_miss_delta)
+        if l3_hit_delta > 0:
+            self.hicache_l3_query_tokens_total.labels(**self.labels, result="hit").inc(
+                l3_hit_delta
+            )
+        if l3_miss_delta > 0:
+            self.hicache_l3_query_tokens_total.labels(**self.labels, result="miss").inc(
+                l3_miss_delta
+            )
+
+        self._last_prefetch_stats = dict(stats)
+
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
 
@@ -1976,6 +2122,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+        self._log_prefetch_stats(storage_metrics.prefetch_stats)
 
 
 class ExpertDispatchCollector(_StatLoggerDIMixin):
