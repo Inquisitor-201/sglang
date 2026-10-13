@@ -2262,7 +2262,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.observe_l3_query(
                 hit_tokens=hit,
-                duration_seconds=operation.query_duration_seconds,
+                duration_seconds=float(
+                    getattr(operation, "query_duration_seconds", 0.0)
+                ),
             )
         self._emit_hicache_trace(
             operation,
@@ -2352,7 +2354,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def _observe_l3_fetch(self, operation) -> None:
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.observe_l3_fetch(
-                duration_seconds=operation.fetch_duration_seconds
+                duration_seconds=float(
+                    getattr(operation, "fetch_duration_seconds", 0.0)
+                )
             )
 
     def prefetch_outcome_stats_snapshot(self) -> dict:

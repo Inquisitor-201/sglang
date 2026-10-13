@@ -1,11 +1,16 @@
 """Unit tests for HiCache L3 observability metrics."""
 
 from collections import defaultdict
+from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    PrefetchOperation as HybridPrefetchOperation,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
@@ -144,3 +149,31 @@ def test_query_and_fetch_histograms_are_observed():
         4096
     ]
     assert _observations(collector.histogram_l3_fetch_duration, tp_rank="0") == [0.034]
+
+
+def test_hybrid_prefetch_operation_has_timing_fields():
+    operation = HybridPrefetchOperation("rid", [1, 2, 3])
+
+    assert operation.query_pages == 0
+    assert operation.query_duration_seconds == 0.0
+    assert operation.fetch_duration_seconds == 0.0
+
+
+def test_prefetch_accounting_tolerates_legacy_operation_without_timing_fields():
+    collector = _RecordingStorageMetricsCollector(labels={"tp_rank": "0"})
+    cache = object.__new__(UnifiedRadixCache)
+    cache.enable_storage_metrics = True
+    cache.storage_metrics_collector = collector
+    cache._prefetch_outcome_stats = defaultdict(int)
+
+    operation = SimpleNamespace(
+        request_id="legacy-rid",
+        stats_requested_tokens=32,
+        stats_total_tokens=32,
+        storage_hit_count=16,
+    )
+
+    cache._account_prefetch_outcome(operation, revoked=False)
+
+    assert _observations(collector.histogram_l3_query_duration, tp_rank="0") == [0.0]
+    assert _observations(collector.histogram_l3_first_miss_tokens, tp_rank="0") == [16]

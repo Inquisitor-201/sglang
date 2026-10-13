@@ -71,6 +71,13 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
+        # Keep the hybrid operation schema aligned with the base HiCache
+        # operation. The hybrid controller has its own PrefetchOperation and
+        # _storage_hit_query implementation, so base-class instrumentation is
+        # not inherited automatically.
+        self.query_pages = 0
+        self.query_duration_seconds = 0.0
+        self.fetch_duration_seconds = 0.0
         super().__init__(
             None,
             token_ids,
@@ -576,10 +583,12 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        query_start = time.perf_counter()
         hash_value = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
         operation.all_hash_values = hash_value
+        operation.query_pages = len(hash_value)
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
@@ -596,6 +605,7 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        operation.query_duration_seconds = time.perf_counter() - query_start
 
         return (
             hash_value[:kv_hit_pages],
