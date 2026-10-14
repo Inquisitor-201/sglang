@@ -509,6 +509,30 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if self.config.tenant_id != DEFAULT_TENANT_ID:
                     setup_kwargs["tenant_id"] = self.config.tenant_id
 
+                # Mooncake's client metrics live in each TP scheduler process,
+                # not in the remote Store process.  Enable one HTTP endpoint
+                # per rank so every client can be scraped without port clashes.
+                enable_client_http_server = os.getenv(
+                    "MOONCAKE_ENABLE_CLIENT_HTTP_SERVER", "false"
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                if enable_client_http_server:
+                    try:
+                        client_http_base_port = int(
+                            os.getenv("MOONCAKE_CLIENT_HTTP_PORT", "9300")
+                        )
+                    except ValueError:
+                        logger.warning(
+                            "Invalid MOONCAKE_CLIENT_HTTP_PORT; falling back to 9300"
+                        )
+                        client_http_base_port = 9300
+                    tp_rank = (
+                        storage_config.tp_rank if storage_config is not None else 0
+                    )
+                    setup_kwargs["enable_client_http_server"] = True
+                    setup_kwargs["client_http_port"] = (
+                        client_http_base_port + tp_rank
+                    )
+
                 while True:
                     try:
                         ret_code = self.store.setup(
