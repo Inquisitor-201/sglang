@@ -219,3 +219,13 @@ def test_summarize_exists_lists_missing_indices_capped(diag_mod):
     summary = diag_mod.summarize_codes([1, 0, 0, 1, 0], kind="exists", max_failed=2)
     assert summary["missing_total"] == 3
     assert summary["missing_idx"] == [1, 2]
+
+
+def test_relative_directory_uses_inst_root(diag_mod, tmp_path, monkeypatch):
+    monkeypatch.setenv("HIPPO_APP_INST_ROOT", str(tmp_path))
+    resolved = diag_mod.resolve_diag_directory("logs/l3diag")
+    assert resolved == str(tmp_path / "logs" / "l3diag")
+
+
+def test_absolute_directory_is_kept(diag_mod, tmp_path):
+    assert diag_mod.resolve_diag_directory(str(tmp_path)) == str(tmp_path)

@@ -64,6 +64,21 @@ def estimate_event_bytes(event: Dict[str, Any]) -> int:
     return total
 
 
+def resolve_diag_directory(directory: str) -> str:
+    """Resolve a relative diagnostic directory against the HyperX app root.
+
+    Deployments share one env value across pods whose install root differs, so
+    the configured directory is relative and each pod lands under its own
+    Themis-readable logs tree.
+    """
+    if not directory or os.path.isabs(directory):
+        return directory
+    root = os.environ.get("HIPPO_APP_INST_ROOT")
+    if root:
+        return str(Path(root) / directory)
+    return directory
+
+
 def compact_indices(indices) -> str:
     """Render sorted page indices as a compact range list: 1-3,7,9-10."""
     values = sorted({int(i) for i in indices})
@@ -449,7 +464,7 @@ def _config_from_env() -> Optional[DiagConfig]:
     if not directory:
         return None
     return DiagConfig(
-        directory=directory,
+        directory=resolve_diag_directory(directory),
         enabled=True,
         overflow_policy=envs.SGLANG_CACHE_DIAG_OVERFLOW_POLICY.get(),
         queue_events=envs.SGLANG_CACHE_DIAG_QUEUE_EVENTS.get(),
