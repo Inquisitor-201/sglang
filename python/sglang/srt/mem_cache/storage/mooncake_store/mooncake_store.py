@@ -51,7 +51,7 @@ def _diag_io(
     if not diagnostics.enabled:
         return
     summary = summarize_codes(codes, op_type)
-    event = {
+    events_event = {
         "op_type": op_type,
         "backend": "mooncake",
         "component": getattr(component, "value", component),
@@ -63,7 +63,6 @@ def _diag_io(
         "physical_last": physical_keys[-1] if physical_keys else None,
         "key_multiplier": key_multiplier,
     }
-    events_event = dict(event)
     events_event.update(summary)
     if op_type == "exists":
         events_event["missing_keys"] = [
@@ -1085,6 +1084,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 all_key_strs, all_ptrs, all_sizes
             )
 
+        put_extra = None
+        if is_set:
+            put_extra = {
+                "put_attempts": len(missing_idx),
+                "put_skipped_existing": sum(1 for s in exist_result if s == 1),
+            }
         for index, (name, key_multiplier, start, end) in enumerate(prepared):
             _diag_io(
                 "put" if is_set else "get",
@@ -1093,6 +1098,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 io_results[start:end],
                 key_multiplier=key_multiplier,
                 component=name,
+                extra=put_extra,
             )
 
         results: dict = {}
