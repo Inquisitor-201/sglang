@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.mem_cache.diagnostics.cache_diag import get_cache_diagnostics
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -1278,31 +1279,36 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                try:
-                    if operation.is_terminated():
-                        hash_value, storage_hit_count = [], 0
-                    else:
-                        hash_value, storage_hit_count = self._storage_hit_query(
-                            operation
+                with get_cache_diagnostics().context(
+                    rid=getattr(operation, "request_id", None),
+                    op_id=operation.id,
+                ):
+                    try:
+                        if operation.is_terminated():
+                            hash_value, storage_hit_count = [], 0
+                        else:
+                            hash_value, storage_hit_count = self._storage_hit_query(
+                                operation
+                            )
+                    except Exception:
+                        logger.exception(
+                            "HiCache storage query failed for request %s",
+                            operation.request_id,
                         )
-                except Exception:
-                    logger.exception(
-                        "HiCache storage query failed for request %s",
-                        operation.request_id,
+                        hash_value, storage_hit_count = [], 0
+
+                    storage_hit_count = self._sync_prefetch_hit_query(
+                        operation, storage_hit_count
                     )
-                    hash_value, storage_hit_count = [], 0
 
-                storage_hit_count = self._sync_prefetch_hit_query(
-                    operation, storage_hit_count
-                )
-
-                # Record the TP-synced hit count; the scheduler thread decides
-                # at drain time whether to revoke (below threshold) or allocate.
-                operation.hash_value = hash_value[
-                    : (storage_hit_count // self.page_size)
-                ]
-                operation.storage_hit_count = storage_hit_count
-                self.prefetch_hit_queue.put(operation)
+                    # Record the TP-synced hit count; the scheduler thread
+                    # decides at drain time whether to revoke (below threshold)
+                    # or allocate.
+                    operation.hash_value = hash_value[
+                        : (storage_hit_count // self.page_size)
+                    ]
+                    operation.storage_hit_count = storage_hit_count
+                    self.prefetch_hit_queue.put(operation)
 
             except Empty:
                 continue
@@ -1388,8 +1394,12 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if not self.backup_skip:
-                    self._page_backup_or_log(operation)
+                with get_cache_diagnostics().context(
+                    rid=getattr(operation, "request_id", None),
+                    op_id=operation.id,
+                ):
+                    if not self.backup_skip:
+                        self._page_backup_or_log(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:

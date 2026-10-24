@@ -2216,6 +2216,31 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(list.unbind())
     }
 
+    /// Enable or disable write-backup decision recording.
+    fn set_diag_enabled(&self, py: Python<'_>, enabled: bool) {
+        py.detach(|| self.core().set_diag_enabled(enabled));
+    }
+
+    /// Drain recorded write-backup decisions as tagged tuples.
+    fn take_diag_events(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let events = py.detach(|| self.core().take_diag_events());
+        let list = PyList::empty(py);
+        for event in events {
+            let item: Py<PyAny> = (
+                "write_decision",
+                event.node_id,
+                event.span_end_tokens,
+                event.hit_count,
+                event.threshold,
+                event.decision,
+                event.reason,
+            )
+                .into_py_any(py)?;
+            list.append(item)?;
+        }
+        Ok(list.unbind())
+    }
+
     /// Drop the subtree rooted at an unbacked D-leaf; not dropped when a lock
     /// blocks it.
     fn drop_subtree_no_host(
@@ -3498,6 +3523,16 @@ macro_rules! tree_core_binding {
             /// Drain the queued placement events as tagged tuples.
             fn take_events(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
                 catch_native_panic(|| self.inner.take_events(py))
+            }
+
+            /// Enable or disable write-backup decision recording.
+            fn set_diag_enabled(&self, py: Python<'_>, enabled: bool) {
+                self.inner.set_diag_enabled(py, enabled);
+            }
+
+            /// Drain recorded write-backup decisions as tagged tuples.
+            fn take_diag_events(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+                catch_native_panic(|| self.inner.take_diag_events(py))
             }
 
             /// Drop the subtree rooted at an unbacked D-leaf; not dropped when a lock

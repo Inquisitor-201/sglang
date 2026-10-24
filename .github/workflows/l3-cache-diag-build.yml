@@ -1,0 +1,21 @@
+name: L3 cache diagnostics build
+
+# Builds the Rust tree-core extension for the diagnostic patch so the worker
+# image can overlay it onto the stock 0.5.22 install.
+
+on:
+  push:
+    branches:
+      - chenlinkun/l3-cache-diag-20261024
+  workflow_dispatch:
+
+jobs:
+  rust-ext:
+    uses: ./.github/workflows/_pr-test-rust-ext-build.yml
+    with:
+      runs_on: ubuntu-22.04
+      restore_runs_on: ubuntu-latest
+      collect_runs_on: ubuntu-22.04
+      artifact_name: rust-ext-l3-cache-diag
+      cache_key_prefix: rust-ext-x86_64-cp312-l3cache-diag
+      skip_pr_test_health_check: true

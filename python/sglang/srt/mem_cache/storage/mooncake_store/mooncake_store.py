@@ -12,6 +12,10 @@ import requests
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.diagnostics.cache_diag import (
+    get_cache_diagnostics,
+    summarize_codes,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
@@ -30,6 +34,52 @@ SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
 
 logger = logging.getLogger(__name__)
+
+
+def _diag_io(
+    op_type: str,
+    logical_keys: List[str],
+    physical_keys: List[str],
+    codes: List[int],
+    *,
+    key_multiplier: int = 1,
+    component: Any = PoolName.KV,
+    extra: Optional[dict] = None,
+) -> None:
+    """Emit one cache.io summary per storage batch, never one line per key."""
+    diagnostics = get_cache_diagnostics()
+    if not diagnostics.enabled:
+        return
+    summary = summarize_codes(codes, op_type)
+    event = {
+        "op_type": op_type,
+        "backend": "mooncake",
+        "component": getattr(component, "value", component),
+        "logical_count": len(logical_keys),
+        "logical_first": logical_keys[0] if logical_keys else None,
+        "logical_last": logical_keys[-1] if logical_keys else None,
+        "physical_count": len(physical_keys),
+        "physical_first": physical_keys[0] if physical_keys else None,
+        "physical_last": physical_keys[-1] if physical_keys else None,
+        "key_multiplier": key_multiplier,
+    }
+    events_event = dict(event)
+    events_event.update(summary)
+    if op_type == "exists":
+        events_event["missing_keys"] = [
+            physical_keys[i]
+            for i in summary.get("missing_idx") or ()
+            if i < len(physical_keys)
+        ]
+    elif op_type == "get":
+        events_event["failed_keys"] = [
+            physical_keys[i]
+            for i in summary.get("failed_idx") or ()
+            if i < len(physical_keys)
+        ]
+    if extra:
+        events_event.update(extra)
+    diagnostics.emit("cache.io", **events_event)
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
@@ -393,6 +443,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.store = MooncakeDistributedStore()
 
             self.config = self._load_config(storage_config)
+            get_cache_diagnostics(
+                tp_rank=getattr(storage_config, "tp_rank", None),
+                pp_rank=getattr(storage_config, "pp_rank", None),
+                dp_rank=getattr(storage_config, "dp_rank", None),
+            )
             extra_config = (
                 getattr(storage_config, "extra_config", None)
                 if storage_config
@@ -894,6 +949,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else []
         )
         for transfer, key_multiplier, start, end in prepared:
+            _diag_io(
+                "exists",
+                keys,
+                all_component_keys[start:end],
+                all_exists[start:end],
+                key_multiplier=key_multiplier,
+                component=transfer.name,
+            )
             if not restorable:
                 break
             ex = all_exists[start:end]
@@ -941,6 +1004,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Expand every pool first so one logical operation becomes one Mooncake
         # RPC rather than one RPC per hybrid-cache component.
         prepared = []
+        prepared_logical_keys = []
         all_key_strs = []
         all_ptrs = []
         all_sizes = []
@@ -971,6 +1035,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self._expand_group_ids(tagged_keys, key_multiplier)
                 )
             prepared.append((transfer.name, key_multiplier, start, len(all_key_strs)))
+            prepared_logical_keys.append(list(keys))
 
         if not prepared:
             return {}
@@ -1018,6 +1083,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         else:
             io_results = self._get_batch_zero_copy_impl(
                 all_key_strs, all_ptrs, all_sizes
+            )
+
+        for index, (name, key_multiplier, start, end) in enumerate(prepared):
+            _diag_io(
+                "put" if is_set else "get",
+                prepared_logical_keys[index],
+                all_key_strs[start:end],
+                io_results[start:end],
+                key_multiplier=key_multiplier,
+                component=name,
             )
 
         results: dict = {}
@@ -1217,6 +1292,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             key_strs, buffer_ptrs, buffer_sizes
         )
         end_time = time.perf_counter()
+        _diag_io("get", keys, key_strs, get_results)
 
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
@@ -1247,6 +1323,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else None
         )
         exist_result = self._batch_exist(key_strs)
+        _diag_io("exists", keys, key_strs, exist_result, key_multiplier=key_multiplier)
 
         set_keys = []
         set_buffer_ptrs = []
@@ -1282,6 +1359,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
 
+        _diag_io(
+            "put",
+            keys,
+            key_strs,
+            set_results,
+            key_multiplier=key_multiplier,
+            extra={
+                "put_attempts": len(set_keys),
+                "put_skipped_existing": sum(1 for s in exist_result if s == 1),
+            },
+        )
         return self._batch_postprocess(set_results, is_set_operate=True)
 
     def set(
@@ -1431,6 +1519,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier = 2
 
         exist_result = self._batch_exist(query_keys, extra_info)
+        _diag_io("exists", keys, query_keys, exist_result, key_multiplier=key_multiplier)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier

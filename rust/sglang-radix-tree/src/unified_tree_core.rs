@@ -589,6 +589,17 @@ impl Default for CacheInitParams {
     }
 }
 
+/// One write-backup decision, recorded only when diagnostics are enabled.
+#[derive(Clone, Debug)]
+pub struct DiagWriteDecision {
+    pub node_id: i64,
+    pub span_end_tokens: i64,
+    pub hit_count: i64,
+    pub threshold: i64,
+    pub decision: bool,
+    pub reason: &'static str,
+}
+
 /// Radix tree of cached token prefixes; each node carries its KV per component.
 /// A single eviction step's outputs: this step's per-component evicted
 /// counts (deltas, for the Controller to accumulate) and freed tensors.
@@ -660,6 +671,10 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) namespaced_event_hashes: HashMap<NodeId, Vec<HashDigest>>,
     /// Hit count at which a node earns a host write-through backup.
     pub(crate) write_through_threshold: i64,
+    /// Whether write-backup decisions are recorded for diagnostics.
+    pub(crate) diag_enabled: bool,
+    /// Recorded write-backup decisions, drained by take_diag_events.
+    pub(crate) diag_events: Vec<DiagWriteDecision>,
 
     /// Per-component monotonic sources for lock-segment UUIDs.
     pub(crate) component_uuid_counters: [i64; NUM_COMPONENT_TYPES],
@@ -936,6 +951,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             kv_event_queue: Vec::new(),
             namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
+            diag_enabled: false,
+            diag_events: Vec::new(),
             component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
             device: params.device,
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
@@ -1612,22 +1629,75 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Increment hit count; check whether a write backup should be fired.
+    /// Enable or disable recording of write-backup decisions.
+    pub fn set_diag_enabled(&mut self, enabled: bool) {
+        self.diag_enabled = enabled;
+    }
+
     pub fn inc_hit_count_and_check_(&mut self, node_id: NodeIdx_) -> bool {
+        self.inc_hit_count_and_check_with_span_(node_id, 0)
+    }
+
+    /// Same decision, additionally recording the span boundary for diagnostics.
+    pub fn inc_hit_count_and_check_with_span_(
+        &mut self,
+        node_id: NodeIdx_,
+        span_end: usize,
+    ) -> bool {
+        let threshold = self.write_through_threshold;
+        let hicache = self.enable_hicache;
+        let write_back = self.is_write_back;
+        let external_linker = self.enable_external_cache_linker;
         let node = self.arena.node_mut(node_id);
+        let mut decision = false;
+        let reason;
         if node.evicted() {
-            return false;
+            reason = "node_evicted";
+        } else if write_back {
+            reason = "write_back_mode";
+        } else {
+            node.hit_count += 1;
+            if external_linker {
+                let needs_offload = Self::needs_external_linker_offload_(node);
+                decision = needs_offload && node.hit_count >= threshold;
+                reason = if decision {
+                    "external_linker"
+                } else if !needs_offload {
+                    "external_copy_pending"
+                } else {
+                    "below_threshold"
+                };
+            } else {
+                decision = hicache && !node.backuped() && node.hit_count >= threshold;
+                reason = if decision {
+                    "backup"
+                } else if !hicache {
+                    "hicache_disabled"
+                } else if node.backuped() {
+                    "already_backuped"
+                } else {
+                    "below_threshold"
+                };
+            }
         }
-        if self.is_write_back {
-            return false;
+        let observed_node_id = node.id as i64;
+        let hit_count = node.hit_count;
+        if self.diag_enabled {
+            self.diag_events.push(DiagWriteDecision {
+                node_id: observed_node_id,
+                span_end_tokens: span_end as i64,
+                hit_count,
+                threshold,
+                decision,
+                reason,
+            });
         }
-        node.hit_count += 1;
+        decision
+    }
 
-        if self.enable_external_cache_linker {
-            return Self::needs_external_linker_offload_(node)
-                && node.hit_count >= self.write_through_threshold;
-        }
-
-        self.enable_hicache && !node.backuped() && node.hit_count >= self.write_through_threshold
+    /// Drain recorded write-backup decisions for the diagnostic channel.
+    pub fn take_diag_events(&mut self) -> Vec<DiagWriteDecision> {
+        std::mem::take(&mut self.diag_events)
     }
 
     /// Insert device values to the tree per the provided key.
@@ -1983,7 +2053,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
         // Nodes this request already inserted were counted back then.
         let node_end = state.total_prefix_length + prefix_len;
-        if node_end > state.inserted_len && self.inc_hit_count_and_check_(node_id) {
+        if node_end > state.inserted_len
+            && self.inc_hit_count_and_check_with_span_(node_id, node_end)
+        {
             let backup = self
                 .build_backup_kv_action_(self.arena.node(node_id), /* write_back = */ false);
             state.pending_actions.push(CacheAction::BackupKV(backup));
@@ -2091,7 +2163,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if state.is_new_leaf {
             // The new leaf runs to the end of the aligned key.
             return state.aligned_key_len > state.inserted_len
-                && self.inc_hit_count_and_check_(target_node_id);
+                && self.inc_hit_count_and_check_with_span_(
+                    target_node_id,
+                    state.aligned_key_len,
+                );
         }
 
         let node = self.arena.node(target_node_id);

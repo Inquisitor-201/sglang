@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
     _dfs_weight_order,
 )
+from sglang.srt.mem_cache.diagnostics.cache_diag import get_cache_diagnostics
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
@@ -1098,23 +1099,67 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def _inc_hit_count_and_check(self, node: UnifiedTreeNode) -> bool:
         """Increment hit count; check whether a write backup should be fired."""
+        diagnostics = get_cache_diagnostics()
         if node.evicted:
+            if diagnostics.enabled:
+                diagnostics.emit(
+                    "cache.write_decision",
+                    backend="python",
+                    node=node.id,
+                    hit_count=node.hit_count,
+                    threshold=self.write_through_threshold,
+                    decision="skip",
+                    reason="node_evicted",
+                )
             return False
         if self.is_write_back:
+            if diagnostics.enabled:
+                diagnostics.emit(
+                    "cache.write_decision",
+                    backend="python",
+                    node=node.id,
+                    hit_count=node.hit_count,
+                    threshold=self.write_through_threshold,
+                    decision="skip",
+                    reason="write_back_mode",
+                )
             return False
         node.hit_count += 1
 
         if self.enable_external_cache_linker:
-            return (
-                self._needs_external_linker_offload(node)
+            needs_offload = self._needs_external_linker_offload(node)
+            decision = needs_offload and node.hit_count >= self.write_through_threshold
+            if decision:
+                reason = "external_linker"
+            elif not needs_offload:
+                reason = "external_copy_pending"
+            else:
+                reason = "below_threshold"
+        else:
+            decision = (
+                self.enable_hicache
+                and not node.backuped
                 and node.hit_count >= self.write_through_threshold
             )
-
-        return (
-            self.enable_hicache
-            and not node.backuped
-            and node.hit_count >= self.write_through_threshold
-        )
+            if decision:
+                reason = "backup"
+            elif not self.enable_hicache:
+                reason = "hicache_disabled"
+            elif node.backuped:
+                reason = "already_backuped"
+            else:
+                reason = "below_threshold"
+        if diagnostics.enabled:
+            diagnostics.emit(
+                "cache.write_decision",
+                backend="python",
+                node=node.id,
+                hit_count=node.hit_count,
+                threshold=self.write_through_threshold,
+                decision="backup" if decision else "skip",
+                reason=reason,
+            )
+        return decision
 
     @staticmethod
     def _needs_external_linker_offload(node: UnifiedTreeNode) -> bool:

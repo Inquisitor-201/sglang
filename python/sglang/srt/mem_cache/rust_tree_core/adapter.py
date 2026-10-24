@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.diagnostics.cache_diag import get_cache_diagnostics
 from sglang.srt.mem_cache.events import LoRANameTable
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -443,6 +444,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             ),
             [int(component) for component in self.tree_components],
         )
+        self._binding.set_diag_enabled(get_cache_diagnostics().enabled)
         self.kv_events = _RustKVCacheEventRecorder(
             self._binding,
             params.enable_kv_cache_events,
@@ -757,16 +759,38 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 rotation_base=params.rotation_base,
             )
         )
+        self._drain_diag_events()
         return _insert_step_from_binding(step)
 
     def resume_insert(self) -> InsertStepResult:
-        return _insert_step_from_binding(self._binding.resume_insert())
+        step = self._binding.resume_insert()
+        self._drain_diag_events()
+        return _insert_step_from_binding(step)
 
     def has_ongoing_insert(self) -> bool:
         return self._binding.has_ongoing_insert()
 
     def end_insert(self) -> list[CacheAction | ComponentAction]:
-        return _cache_actions_from_tagged(self._binding.end_insert())
+        actions = self._binding.end_insert()
+        self._drain_diag_events()
+        return _cache_actions_from_tagged(actions)
+
+    def _drain_diag_events(self) -> None:
+        diagnostics = get_cache_diagnostics()
+        if not diagnostics.enabled:
+            return
+        for event in self._binding.take_diag_events():
+            _, node_id, span_end, hit_count, threshold, decision, reason = event
+            diagnostics.emit(
+                "cache.write_decision",
+                backend="rust",
+                node=node_id,
+                span_end_tokens=span_end,
+                hit_count=hit_count,
+                threshold=threshold,
+                decision="backup" if decision else "skip",
+                reason=reason,
+            )
 
     def drive_host_eviction(
         self, component_type: ComponentType, num_tokens: int

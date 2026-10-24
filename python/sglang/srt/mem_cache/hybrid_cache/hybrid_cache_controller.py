@@ -27,6 +27,10 @@ from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.diagnostics.cache_diag import (
+    compact_indices,
+    get_cache_diagnostics,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
@@ -1119,10 +1123,28 @@ class HybridCacheController(BaseHiCacheController):
         self._all_reduce(hit_tensor, torch.distributed.ReduceOp.MIN, local_groups)
         storage_hit_count = int(hit_tensor.item())
         storage_hit_count -= storage_hit_count % self.page_size
+        diagnostics = get_cache_diagnostics()
         if storage_hit_count < self.prefetch_threshold:
+            diagnostics.emit(
+                "cache.lookup",
+                stage="pp_select",
+                rid=rid,
+                decision="skipped",
+                reason="below_threshold",
+                after_min_tokens=storage_hit_count,
+                threshold=self.prefetch_threshold,
+            )
             with self.pp_prefetch_state_lock:
                 self.pp_prefetch_decisions[rid] = PPPrefetchDecision.SKIPPED
             return PrefetchSubmission(decision=False)
+        diagnostics.emit(
+            "cache.lookup",
+            stage="pp_select",
+            rid=rid,
+            decision="ticketed",
+            after_min_tokens=storage_hit_count,
+            threshold=self.prefetch_threshold,
+        )
 
         ticket.storage_hit_count = storage_hit_count
         operation.is_pp_broadcast = True
@@ -1370,6 +1392,8 @@ class HybridCacheController(BaseHiCacheController):
             operation.token_ids, operation.last_hash, page_size=self.page_size
         )
         operation.all_hash_values = hash_value
+        diagnostics = get_cache_diagnostics()
+        query_pages = len(hash_value)
 
         if operation.assume_stored:
             # A prior hit on a suffix of this span proved it stored, and writes
@@ -1378,6 +1402,18 @@ class HybridCacheController(BaseHiCacheController):
             kv_hit_pages = len(hash_value)
             operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
             operation.query_pool_hit_pages = {}
+            diagnostics.emit(
+                "cache.lookup",
+                stage="query",
+                decision="assume_stored",
+                rid=operation.request_id,
+                op_id=operation.id,
+                pp_rank=pp_rank,
+                page_size=self.page_size,
+                query_pages=query_pages,
+                kv_hit_pages=kv_hit_pages,
+                hit_tokens=kv_hit_pages * self.page_size,
+            )
             return hash_value, kv_hit_pages * self.page_size
 
         extra_info = HiCacheStorageExtraInfo(
@@ -1407,6 +1443,27 @@ class HybridCacheController(BaseHiCacheController):
             if transfer.name in pool_hits:
                 operation.query_pool_hit_pages[transfer.name] = pool_hits[transfer.name]
 
+        restorable = hit_result.restorable_prefix_pages
+        if restorable is None:
+            restorable = list(range(1, kv_hit_pages + 1))
+        diagnostics.emit(
+            "cache.lookup",
+            stage="query",
+            decision="queried",
+            rid=operation.request_id,
+            op_id=operation.id,
+            pp_rank=pp_rank,
+            page_size=self.page_size,
+            query_pages=query_pages,
+            kv_hit_pages=kv_hit_pages,
+            hit_tokens=kv_hit_pages * self.page_size,
+            pool_hit_pages={
+                getattr(name, "value", name): pages
+                for name, pages in pool_hits.items()
+            },
+            restorable=compact_indices(restorable),
+            restorable_max=max(restorable) if restorable else 0,
+        )
         return (
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
@@ -1418,6 +1475,18 @@ class HybridCacheController(BaseHiCacheController):
         by any rank heals from the folded cut without learning presence."""
         pools = list(PoolName)
         local = operation.query_pool_hit_pages
+        diagnostics = get_cache_diagnostics()
+        diagnostics.emit(
+            "cache.lookup",
+            stage="before_min",
+            rid=operation.request_id,
+            op_id=operation.id,
+            local_tokens=storage_hit_count,
+            pool_hit_pages={
+                getattr(pool, "value", pool): local.get(pool, _NO_POOL_VERDICT)
+                for pool in pools
+            },
+        )
         packed = torch.tensor(
             [storage_hit_count] + [local.get(pool, _NO_POOL_VERDICT) for pool in pools],
             dtype=torch.int,
@@ -1433,6 +1502,19 @@ class HybridCacheController(BaseHiCacheController):
             for pool, pages in zip(pools, reduced[1:], strict=True)
             if pages != _NO_POOL_VERDICT
         }
+        diagnostics.emit(
+            "cache.lookup",
+            stage="after_min",
+            rid=operation.request_id,
+            op_id=operation.id,
+            before_tokens=storage_hit_count,
+            after_tokens=int(reduced[0]),
+            pool_hit_pages_after={
+                getattr(pool, "value", pool): pages
+                for pool, pages in zip(pools, reduced[1:], strict=True)
+                if pages != _NO_POOL_VERDICT
+            },
+        )
         return int(reduced[0])
 
     def _move_pool_indices(

@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     default_belief_policy,
 )
 from sglang.srt.mem_cache.common import RetractionBackup
+from sglang.srt.mem_cache.diagnostics.cache_diag import get_cache_diagnostics
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -2005,9 +2006,17 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         req_id = request.rid
+        diagnostics = get_cache_diagnostics()
         self.storage_prefetch_retries.cancel(req_id)
         submission = self.cache_controller.get_prefetch_submission(req_id)
         if submission is not None:
+            diagnostics.emit(
+                "cache.lookup",
+                stage="admission",
+                rid=req_id,
+                decision="skipped",
+                reason="pp_decision",
+            )
             return submission.decision
 
         buffer_mode = self.host_memory_mode == "buffer_only"
@@ -2015,6 +2024,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self.buffer_pipeline is not None
             and self.buffer_pipeline.has_staged(request)
         ):
+            diagnostics.emit(
+                "cache.lookup",
+                stage="admission",
+                rid=req_id,
+                decision="skipped",
+                reason="already_in_flight",
+            )
             return
         # Prefix-covered writes justify extending a known hit to the left,
         # never beyond its confirmed right endpoint (including the SWA window).
@@ -2061,9 +2077,26 @@ class UnifiedRadixCache(BasePrefixCache):
             # No lookup was issued, so no retry is armed: polling here would
             # spend the re-issue budget the admission-time device-hit-loss
             # re-query needs once the device match evicts while queued.
+            diagnostics.emit(
+                "cache.lookup",
+                stage="admission",
+                rid=req_id,
+                decision="skipped",
+                reason="too_short",
+                request_tokens=prefetch_length,
+                threshold=self.prefetch_threshold,
+            )
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
+            diagnostics.emit(
+                "cache.lookup",
+                stage="admission",
+                rid=req_id,
+                decision="skipped",
+                reason="rate_limited",
+                request_tokens=prefetch_length,
+            )
             # Paced: the limiter clears as transfers finish, not on the next pass.
             self.storage_prefetch_retries.poll_miss(req_id, storage_hit_end)
             return
@@ -2392,6 +2425,18 @@ class UnifiedRadixCache(BasePrefixCache):
             loaded_from_storage,
             self.cache_controller.prefetch_tokens_occupied,
         )
+        get_cache_diagnostics().emit(
+            "cache.restore",
+            stage="complete",
+            rid=request.rid,
+            outcome=(
+                "insert_dropped" if insert_result.host_insert_dropped else "success"
+            ),
+            completed_tokens=completed_tokens,
+            matched_tokens=insert_result.prefix_len,
+            loaded_tokens=loaded_from_storage,
+            storage_start=operation.storage_start,
+        )
         return
 
     def _check_hybrid_prefetch_result(
@@ -2497,6 +2542,20 @@ class UnifiedRadixCache(BasePrefixCache):
                     for transfer, count in zip(pool_transfers, pool_hit_pages)
                 },
             )
+            get_cache_diagnostics().emit(
+                "cache.restore",
+                stage="discard",
+                rid=request.rid,
+                outcome="discarded",
+                reason="storage_transfer",
+                completed_tokens=completed_tokens,
+                requested_tokens=expected_tokens,
+                kept_pages=keep_pages,
+                pool_hit_pages={
+                    getattr(transfer.name, "value", transfer.name): count
+                    for transfer, count in zip(pool_transfers, pool_hit_pages)
+                },
+            )
             return False
         return True
 
@@ -2568,6 +2627,15 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens(
                 unfulfilled, reason
             )
+        get_cache_diagnostics().emit(
+            "cache.restore",
+            stage="finish",
+            rid=request.rid,
+            outcome="unfulfilled" if unfulfilled else "fulfilled",
+            reason=reason,
+            fulfilled_tokens=fulfilled_tokens,
+            unfulfilled_tokens=unfulfilled,
+        )
 
     def _settle_storage_prefetch_hit(
         self, request: CacheRequestHandle, credited_tokens: int

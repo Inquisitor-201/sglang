@@ -356,6 +356,20 @@ class Envs:
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
 
     # ===================================================================
+    # Cache diagnostics (experimental)
+    # ===================================================================
+    # Directory for structured cache.* diagnostic JSONL events. Unset disables
+    # the whole diagnostic path: no thread, no queue, no file, no field work.
+    SGLANG_CACHE_DIAG_DIR = EnvStr(None)
+    # Queue overflow behavior when the background writer cannot keep up:
+    # "drop" protects inference, "block" protects evidence completeness.
+    SGLANG_CACHE_DIAG_OVERFLOW_POLICY = EnvStr("drop")
+    SGLANG_CACHE_DIAG_QUEUE_EVENTS = EnvInt(65536)
+    SGLANG_CACHE_DIAG_QUEUE_BYTES = EnvInt(256 << 20)
+    SGLANG_CACHE_DIAG_MAX_FILE_BYTES = EnvInt(256 << 20)
+    SGLANG_CACHE_DIAG_KEEP_FILES = EnvInt(8)
+
+    # ===================================================================
     # IPC, broadcasters, and ports
     # ===================================================================
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
